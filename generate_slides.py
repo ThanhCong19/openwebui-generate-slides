@@ -3,7 +3,7 @@ title: Generate Slides
 author: IANUSTEC
 author_url: https://ianustec.com
 funding_url: https://github.com/ianustec
-description: Generate high-quality native PowerPoint (.pptx) presentations from a JSON spec - layered graphics, native charts, icons, rich layouts. With an attached .pptx used as base/template, ALWAYS call inspect_slides first, then generate_slides with reference_file_id + per-slide reuse.
+description: Generate high-quality native PowerPoint (.pptx) presentations from a JSON spec - layered graphics, native charts, icons, rich layouts. For the spec format, the template workflow and the edit operations, the model should call view_skill("slides").
 requirements: python-pptx, pillow
 required_open_webui_version: 0.4.0
 version: 1.0.4
@@ -6309,32 +6309,11 @@ class Tools:
         __request__: Any = None,
         __user__: Optional[dict] = None,
     ) -> str:
-        """MANDATORY FIRST STEP whenever a .pptx is attached or the user wants
-        their own slides used as base/template/style. Returns a compact JSON
-        inventory: file_id, and per slide the text ids and table ids to
-        rewrite. Decorations are omitted on purpose (a template slide can
-        have hundreds) and are cloned automatically. Then call
-        `generate_slides` once, following the "next" field. Never call
-        `generate_slides` for a template request before this tool has
-        returned, and never call this tool a second time with a different id.
+        """List the text and table ids of a .pptx as compact JSON: the attached
+        template, or a deck made by generate_slides / edit_presentation.
 
-        Trigger phrases (any language), e.g.: "usa le slide in allegato come
-        base", "usa questo template / questa presentazione come base",
-        "mantieni lo stile del file allegato", "partendo dal pptx allegato",
-        "use the attached deck as template", "same look as this file".
-        Also call it when the user asks to inspect/analyze/inventory a .pptx.
-
-        Do NOT call it when no .pptx is involved (classic deck from scratch).
-
-        Pass `file_id` from the Open WebUI Files API, or omit it when the user
-        attached a .pptx in the current chat (auto-detected from messages).
-        Copy file_id character for character into generate_slides
-        reference_file_id. Never invent, shorten, or replace it. If a call
-        fails, do not switch to a classic deck: reuse the file_id that worked.
-
-        slides[].text and slides[].tables are a faithful copy of the .pptx
-        (Slidesgo placeholders included). Inspect never rewrites them. Omit
-        keep_ids in reuse so unlisted decorations are cloned.
+        IMPORTANT: call view_skill("slides") FIRST — it says when to inspect and
+        how to use the ids. Omit `file_id` to read the .pptx attached in this chat.
         """
         __messages__ = _with_owui_files(__messages__, __files__)
         if not self.valves.inspect_slides_enabled:
@@ -6434,57 +6413,12 @@ class Tools:
         __metadata__: Any = None,
         __request__: Any = None,
     ) -> str:
-        """Apply deterministic edits to an existing generated .pptx (post-download).
+        """Edit a deck made by generate_slides (text, font size, table cells,
+        background image) without rebuilding it; returns a new download link.
 
-        Use this for small visual/text fixes after the user reviewed a deck from
-        `generate_slides` — not to rebuild the deck. Do **not** use
-        `reference_file_id` or the template inspect file_id; use
-        `presentation_file_id` (Files API UUID from the last generate/edit tool
-        file block).
-
-        Requires admin valve `presentation_edit_enabled=true`. Chat attachments
-        are **not** auto-detected.
-
-        `content` must be a single JSON string, for example:
-
-        {
-          "presentation_file_id": "<uuid from last generate/edit>",
-          "title": "Optional save title",
-          "operations": [
-            {
-              "op": "set_text",
-              "slide": 1,
-              "shape_id": 783,
-              "text": "Shorter title"
-            },
-            {
-              "op": "shrink_font",
-              "slide": 1,
-              "shape_id": 783,
-              "min_pt": 18,
-              "step_pt": 2
-            }
-          ]
-        }
-
-        Slide field in operations follows EDIT_SLIDE_INDEX_ORIGIN at top of this
-        file (1 = PowerPoint/LibreOffice numbering; 0 = 0-based / inspect index).
-        On the same shape,
-        prefer `replace_text_and_fit` over `set_text` + `shrink_font`. For
-        "fit like PowerPoint", use `enable_autofit`. Split one textbox across
-        two placeholders with `split_text`. Tables: `set_table_cell` only.
-
-        v2 ops: enable_autofit, replace_text_and_fit, split_text, resize_shape,
-        set_table_cell, set_font_pt. shrink_font optional mode: fit (default),
-        to_min, target (requires target_pt). See doc/neura-presentation-edit-hints.md.
-
-        set_background_image {"slide", "overlay", "crop", "overlay_color"} puts
-        the latest image the user attached in this chat behind one slide (no
-        shape_id; one op per slide). overlay 0..0.95 (default 0.7) is the
-        opacity of a layer in the slide's old background color, so the text
-        stays readable: lower = clearer photo. crop {"top","bottom","left",
-        "right"} cuts 0..0.45 of each edge first (e.g. a caption or logo baked
-        into the image). Repeating the op on a slide replaces its background.
+        IMPORTANT: call view_skill("slides") FIRST — it lists the operations and
+        when to edit instead of regenerating. `content` is a single JSON string:
+        {"presentation_file_id", "title", "operations": [...]}.
         """
         __messages__ = _with_owui_files(__messages__, __files__)
         if not self.valves.presentation_edit_enabled:
@@ -6671,158 +6605,12 @@ class Tools:
         __metadata__: Any = None,
         __request__: Any = None,
     ) -> str:
-        """Create a high-quality NATIVE PowerPoint (.pptx) and return a download
-        link.
+        """Build a native PowerPoint (.pptx) from a JSON spec and return a
+        download link.
 
-        PRECONDITION — attached .pptx / "usa le slide in allegato come base",
-        "usa questo template", "stesso stile del file", "use the attached
-        deck": you MUST call `inspect_slides` FIRST and only then call this
-        tool with the same Files API id as `reference_file_id` and per-slide
-        `reuse` built from inspect slides[].text / slides[].tables (ids only;
-        decorations are cloned when keep_ids is omitted). An id that is not
-        the attached file is rejected. Do not fall back to a classic deck.
-
-        Do NOT use this tool to analyze or inventory a template .pptx — that
-        is `inspect_slides`. If the user asks only for the inspect JSON, do not
-        call generate_slides and do not replace the tool JSON with a markdown
-        summary.
-
-        Template workflow (when the user wants their .pptx look):
-        1) `inspect_slides` → factual inventory JSON (verbatim in the reply).
-        2) This tool: same `reference_file_id`, one output slide per template
-           slide to mirror, each with `reuse` {slide, keep_ids/drop_ids, text}.
-
-        The `content` parameter MUST be a SINGLE JSON string (no text before or
-        after, no markdown fence). Structure:
-
-        {
-          "title": "Presentation title",
-          "subtitle": "Subtitle (optional)",
-          "author": "Author / company (optional)",
-          "theme": "auto",              // auto | midnight | forest | ocean |
-                                        // coral | terracotta | teal | berry |
-                                        // sage | cherry | charcoal | slate
-          "accent": "#C99A3B",          // opt: force the accent color
-          "footer": "Footer label",      // opt
-          "reference_file_id": "<file_id from inspect_slides, copied verbatim>",
-          "template_mapping": {          // opt: reference slide index per role
-            "default": 0, "cover": 0, "content": 1, "closing": 2
-          },
-          "template_edits": {            // opt: clone policy (defaults false)
-            "defaults": {
-              "drop_text": false,
-              "drop_placeholders": false,
-              "drop_offslide": true
-            },
-            "slides": [{ "index": 0, "drop_ids": [12, 18] }]
-          },
-          "slides": [
-            {
-              "layout": "cover",
-              "reuse": {
-                "slide": 0,
-                "keep_ids": [3, 4, 8, 9],
-                "drop_ids": [10],
-                "text": { "8": "New title", "9": "Subtitle" }
-              }
-            },
-            {
-              "reuse": {
-                "slide": 9,
-                "text": {
-                  "9": "Project tracker",
-                  "2": { "headers": ["Project", "Status"],
-                         "rows": [["Alpha", "Done"], ["Beta", "WIP"]] }
-                }
-              }
-            },
-            { "layout": "title_bullets", "title": "...", "bullets": [] }
-          ]
-        }
-
-        Per-slide `reuse` (preferred when mirroring a multi-slide template):
-        clone template slide `reuse.slide` (0-based, same as inspect
-        slides[].index), copy shapes by inspect `shapes[].id` via keep_ids /
-        drop_ids, replace text in place via `text` — no classic layout overlay
-        on that slide. Omit keep_ids to clone all cloneable shapes minus
-        drop_ids. Requires reference_file_id + template_mode_enabled.
-        `reference_file_id` is the inspect_slides `file_id` copied verbatim
-        (a UUID, 8-4-4-4-12 hex). A number, a filename, or a slide index is
-        rejected and you must call this tool again with the real id. Never
-        invent one.
-
-        Template tables (inspect `kind: "table"`, with `table.rows/cols/cells`)
-        are refilled in place: `text["<table id>"] = {"headers": [...],
-        "rows": [[...]]}` keeps the template cell formatting; rows/columns are
-        added or removed to fit the data. If the slide also carries the
-        classic `headers`/`rows` and the template slide has exactly one table,
-        they are routed to that table automatically. A plain string on a table
-        id is an error.
-
-        `template_mapping` accepts explicit layout keys (e.g. `"table": 9`,
-        `"team": 7`) which win over the coarse cover/section/closing/content
-        roles when a slide is not using `reuse`.
-
-        `drop_ids` use shape `id` from inspect JSON, not slide shape order.
-        Set `drop_text` / remove text only when the user explicitly wants template
-        wording removed (R8); default is to clone template textboxes.
-
-        Requires admin valve `template_mode_enabled` for template rendering
-        when `reference_file_id` is set. The valve alone does not clone a chat
-        attachment: without `reference_file_id` (plus `template_mapping` and
-        `template_edits` when needed) the deck is always the classic theme
-        engine, even if the valve is true. If the valve is off, a provided
-        reference is ignored and a classic deck is generated (NF8). If the
-        valve is on and download, parse, or clone of the reference fails, the
-        tool returns an error and does not produce a `.pptx` (F9). Do not
-        retry the same request without `reference_file_id` when the user asked
-        to keep their template. Template mode does not use chat attachments;
-        only an explicit `reference_file_id` in this JSON applies
-        the template.
-
-        Each slide has a `layout` and fields consistent with that layout. Common
-        fields: `title`, `eyebrow` (kicker, e.g. "PART I"), `subtitle`.
-
-        AVAILABLE LAYOUTS and main fields:
-        - "cover":        title, subtitle, author, eyebrow, icon, date, chips[]
-        - "section":      number ("01"), eyebrow, title, lead   (chapter divider)
-        - "title_bullets":title, eyebrow, bullets[] (or points/items)
-        - "title_body":   title, eyebrow, body (paragraphs separated by \\n)
-        - "two_column_text"/"comparison_two": left{}, right{} OR columns[];
-              each card: {heading, icon, subtitle, description, points[],
-              highlight:true, badge:"Most chosen"}
-        - "kpi_row":      title, stats[] with {value, label, change}
-        - "timeline_horizontal"/"process_flow": steps[] with {when, title, description}
-        - "icon_list_vertical": items[] with {icon, title, description}
-        - "icon_grid_2x2"/"icon_grid_3"/"pillars": items[] with {icon, title, description}
-        - "chart":        chart_type (bar|line|area|pie|doughnut|radar|stacked_bar),
-              labels[] and values[]  OR  datasets[]{label,data[]};
-              opt. insight[]/insight_title for side text
-        - "funnel"/"pyramid"/"cycle"/"quadrant"/"bullseye": nodes[] with
-              {label, description}; quadrant accepts x_axis/y_axis and points[]
-        - "quote":        quote, author, role
-        - "alert":        title, level (info|tip|warning|danger), body or bullets[]
-        - "table":        headers[], rows[] (lists or list of dicts)
-        - "text_image_right"/"image_left_text_right": title, bullets[]/body,
-              image_hint ("stock query") or image_url or base64
-        - "image_full_caption": title, subtitle, image_hint/image_url
-        - "closing":      title, eyebrow, takeaways[], contact
-
-        DESIGN GUIDELINES (follow them):
-        - "Sandwich" structure: start with "cover", use "section" between macro
-          topics, end with "closing". Alternate layouts: do NOT repeat the same
-          bulleted-list slide back to back.
-        - 3-6 short bullets per slide. Prefer data/numbers: use "kpi_row",
-          "chart", "funnel"/"pyramid" instead of long lists.
-        - Use `eyebrow` to number the parts ("PART I — CONTEXT").
-        - Icons: names like target, rocket, lightbulb, shield, lock, users,
-          trending-up, bar-chart, cloud, cpu, dollar-sign, check-circle, award,
-          layers, scale, workflow, globe, calendar, book-open, settings.
-        - Choose `theme:"auto"` if unspecified: it is inferred from the content.
-        - 10-18 slides for a full deck; do not generate walls of text.
-
-        Returns a [TOOL_RESULT ...] line with the markdown link to show the user
-        so they can download the .pptx.
+        IMPORTANT: call view_skill("slides") FIRST — it holds the spec format,
+        layouts, the template (reuse) workflow and the deck rules. Never call
+        this tool without reading it. `content` is a single JSON string.
         """
         __messages__ = _with_owui_files(__messages__, __files__)
         if not _HAS_PPTX:

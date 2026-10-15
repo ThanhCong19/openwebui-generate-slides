@@ -51,6 +51,15 @@ See [CHANGELOG.md](CHANGELOG.md) for release notes.
 3. Save. The declared dependencies are installed on first use.
 4. Enable the tool for the model (or chat) that should use it.
 
+### Skill (required in this fork)
+The tool docstrings are kept short; the spec format, layouts, template workflow, edit
+operations and deck rules live in [`SKILL.md`](SKILL.md), which the model loads on demand with
+`view_skill("slides")` (Open WebUI ≥ 0.10, native function calling).
+1. **Workspace → Skills → Import** `SKILL.md` (keeps the frontmatter; the id becomes `slides`).
+2. Give read access to everyone who uses the model: a user who neither owns the skill nor has
+   read access does not get it, admins included.
+3. Tick the skill on the model next to the tool.
+
 ## Usage
 
 The model calls `generate_slides(content)`, where `content` is a **single JSON string**.
