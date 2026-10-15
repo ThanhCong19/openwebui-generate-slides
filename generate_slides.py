@@ -2670,6 +2670,31 @@ def _inspect_tool_result(payload: dict) -> str:
     )
 
 
+# Name Tools._save gives every deck: presentation-<slug>_<YYYYMMDD>_<6 hex>.pptx
+_GENERATED_DECK_RE = re.compile(r"^presentation-.*_\d{8}_[0-9a-f]{6}\.pptx$")
+
+
+def _edit_inspect_tool_result(payload: dict) -> str:
+    """inspect_slides on a deck this tool saved: the ids feed edit_presentation,
+    not a new template deck."""
+    first = 1 if EDIT_SLIDE_INDEX_ORIGIN == 1 else 0
+    payload = {
+        **payload,
+        "next": (
+            "This is a generated deck, not a template. Call edit_presentation "
+            f'with presentation_file_id "{payload.get("file_id") or ""}" and these '
+            f"ids as shape_id; operations[].slide is index + {first}. "
+            "Do not call generate_slides."
+        ),
+    }
+    body = json.dumps(payload, indent=2, ensure_ascii=False)
+    return (
+        "[TOOL_RESULT — do not paste this JSON to the user. "
+        'Your next action is one edit_presentation call, as stated in "next".]\n\n'
+        + body
+    )
+
+
 def _is_presentation_file(name: str, content_type: Optional[str] = None) -> bool:
     n = (name or "").strip().lower()
     if n.endswith(_PPTX_EXTENSIONS):
@@ -2761,6 +2786,17 @@ def _find_pptx_attachment(messages: Any) -> Optional[str]:
                 if str(name).lower().endswith(_PPTX_EXTENSIONS):
                     return fid
     return None
+
+
+def _with_owui_files(messages: Any, files: Any) -> list:
+    """Open WebUI >= 0.10 strips `files` from every message before tools run;
+    chat attachments reach tools only as `__files__`. Append them as one last
+    message, newest first, so _find_pptx_attachment sees them."""
+    msgs = list(_as_list(messages))
+    attached = [f for f in _as_list(files) if isinstance(f, dict)]
+    if attached:
+        msgs.append({"files": attached[::-1]})
+    return msgs
 
 
 def _file_model_name_and_type(file_obj) -> tuple[str, str]:
@@ -3718,6 +3754,7 @@ _EDIT_KNOWN_OPS = (
     "split_text",
     "resize_shape",
     "set_table_cell",
+    "set_background_image",
 )
 
 _EDIT_SHRINK_MODES = ("fit", "to_min", "target")
@@ -3794,6 +3831,9 @@ def _normalize_edit_op(op: dict, i: int, valves: Any) -> dict:
             "to_shape_id": to_id,
             "mode": mode,
         }
+
+    if name == "set_background_image":
+        return _normalize_background_op(op, i, slide_idx)
 
     if name == "set_table_cell":
         try:
@@ -4185,6 +4225,138 @@ def _edit_set_table_cell(shape, row: int, col: int, text: str) -> bool:
     return (cell.text or "").strip() != before
 
 
+# --- set_background_image: ảnh người dùng gửi trong chat làm nền một slide ---
+# Open WebUI đưa ảnh đính kèm vào content của user message dưới dạng image_url
+# (data URL base64 khi tới tool), không qua __files__. Lớp phủ (scrim) mang màu
+# nền cũ của slide để chữ thiết kế cho nền đó vẫn đọc được trên ảnh.
+_BG_SCRIM_NAME = "edit-bg-scrim"
+_BG_CROP_SIDES = ("top", "bottom", "left", "right")
+_BG_OVERLAY_DEFAULT = 0.7
+
+
+def _normalize_background_op(op: dict, i: int, slide_idx: int) -> dict:
+    where = f"operations[{i}] set_background_image"
+    try:
+        overlay = float(op.get("overlay", _BG_OVERLAY_DEFAULT))
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{where}: overlay must be a number 0..0.95.") from exc
+    if not 0 <= overlay <= 0.95:
+        raise ValueError(f"{where}: overlay must be 0..0.95.")
+    crop_raw = op.get("crop") or {}
+    if not isinstance(crop_raw, dict) or set(crop_raw) - set(_BG_CROP_SIDES):
+        raise ValueError(f"{where}: crop takes top, bottom, left, right (0..0.45 each).")
+    crop = {}
+    for side in _BG_CROP_SIDES:
+        try:
+            crop[side] = float(crop_raw.get(side, 0) or 0)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"{where}: crop.{side} must be a number 0..0.45.") from exc
+        if not 0 <= crop[side] <= 0.45:
+            raise ValueError(f"{where}: crop.{side} must be 0..0.45.")
+    entry = {"op": "set_background_image", "slide": slide_idx, "overlay": overlay, "crop": crop}
+    color = (op.get("overlay_color") or "").strip()
+    if color:
+        if not re.fullmatch(r"#?[0-9A-Fa-f]{6}", color):
+            raise ValueError(f"{where}: overlay_color must be a hex color like #1E2761.")
+        entry["overlay_color"] = color.lstrip("#").upper()
+    return entry
+
+
+def _latest_chat_image(messages: Any) -> Optional[bytes]:
+    """Ảnh mới nhất người dùng gửi trong chat (phần image_url của user message)."""
+    for msg in reversed(_as_list(messages)):
+        if not isinstance(msg, dict) or msg.get("role") != "user":
+            continue
+        content = msg.get("content")
+        if not isinstance(content, list):
+            continue
+        for part in reversed(content):
+            if not isinstance(part, dict) or part.get("type") != "image_url":
+                continue
+            ref = part.get("image_url")
+            url = ref.get("url") if isinstance(ref, dict) else ref
+            raw = _decode_data_image(url or "")
+            if raw:
+                return raw
+    return None
+
+
+def _crop_edges(raw: bytes, crop: dict) -> Optional[bytes]:
+    if not any(crop.values()):
+        return raw
+    if not _HAS_PIL:
+        return None
+    try:
+        im = Image.open(BytesIO(raw)).convert("RGB")
+    except Exception:
+        return None
+    w, h = im.size
+    im = im.crop((int(w * crop["left"]), int(h * crop["top"]),
+                  w - int(w * crop["right"]), h - int(h * crop["bottom"])))
+    out = BytesIO()
+    im.save(out, format="PNG")
+    return out.getvalue()
+
+
+def _edit_set_background_image(prs, op: dict, valves: Any) -> bool:
+    n = len(prs.slides)
+    if not 0 <= op["slide"] < n:
+        shown = _edit_slide_internal_to_json(op["slide"])
+        raise ValueError(
+            f"slide {shown} out of range (deck has {n} slide(s); "
+            f"{_edit_slide_range_hint(n)})."
+        )
+    raw = op.get("image")
+    if not raw:
+        raise ValueError("no image attached in the chat for set_background_image.")
+    cropped = _crop_edges(raw, op["crop"])
+    image = _cover_crop(cropped, prs.slide_width / prs.slide_height,
+                        int(getattr(valves, "max_image_px", 1600) or 1600)) if cropped else None
+    if not image:
+        raise ValueError("the attached image could not be read as a picture.")
+
+    slide = prs.slides[op["slide"]]
+    sp_tree = slide.shapes._spTree
+    old_scrim = next((sh for sh in slide.shapes if sh.name == _BG_SCRIM_NAME), None)
+    color = op.get("overlay_color")
+    if not color and old_scrim is not None:
+        color = str(old_scrim.fill.fore_color.rgb)
+    if not color:
+        fill = slide.background.fill
+        try:
+            color = str(fill.fore_color.rgb) if fill.type == MSO_FILL_TYPE.SOLID else None
+        except Exception:
+            color = None
+    color = color or "FFFFFF"
+    if old_scrim is not None:
+        sp_tree.remove(old_scrim._element)
+
+    _, r_id = slide.part.get_or_add_image_part(BytesIO(image))
+    c_sld = slide._element.find(qn("p:cSld"))
+    for old_bg in c_sld.findall(qn("p:bg")):
+        c_sld.remove(old_bg)
+    bg = c_sld.makeelement(qn("p:bg"), {})
+    bg_pr = bg.makeelement(qn("p:bgPr"), {})
+    blip_fill = bg_pr.makeelement(qn("a:blipFill"), {"rotWithShape": "1"})
+    blip_fill.append(blip_fill.makeelement(qn("a:blip"), {qn("r:embed"): r_id}))
+    stretch = blip_fill.makeelement(qn("a:stretch"), {})
+    stretch.append(stretch.makeelement(qn("a:fillRect"), {}))
+    blip_fill.append(stretch)
+    bg_pr.append(blip_fill)
+    bg_pr.append(bg_pr.makeelement(qn("a:effectLst"), {}))
+    bg.append(bg_pr)
+    c_sld.insert(0, bg)
+
+    if op["overlay"] > 0:
+        scrim = slide.shapes.add_shape(MSO_SHAPE.RECTANGLE, 0, 0, prs.slide_width, prs.slide_height)
+        scrim.name = _BG_SCRIM_NAME
+        _fill_alpha(scrim, color, op["overlay"] * 100)
+        scrim.line.fill.background()
+        sp_tree.remove(scrim._element)
+        sp_tree.insert(2, scrim._element)  # sau nvGrpSpPr, grpSpPr: dưới mọi hình
+    return True
+
+
 def _apply_edit_op(prs, op: dict, valves: Any, op_index: int) -> bool:
     name = op["op"]
     if name == "split_text":
@@ -4193,6 +4365,9 @@ def _apply_edit_op(prs, op: dict, valves: Any, op_index: int) -> bool:
         )
         to_sh = _resolve_edit_shape(prs, op["slide"], op["to_shape_id"])
         return _edit_split_text(from_sh, to_sh, op["mode"])
+
+    if name == "set_background_image":
+        return _edit_set_background_image(prs, op, valves)
 
     if name == "set_table_cell":
         shape = _resolve_edit_shape(
@@ -6130,6 +6305,7 @@ class Tools:
         self,
         file_id: str = "",
         __messages__: Any = None,
+        __files__: Any = None,
         __request__: Any = None,
         __user__: Optional[dict] = None,
     ) -> str:
@@ -6160,6 +6336,7 @@ class Tools:
         (Slidesgo placeholders included). Inspect never rewrites them. Omit
         keep_ids in reuse so unlisted decorations are cloned.
         """
+        __messages__ = _with_owui_files(__messages__, __files__)
         if not self.valves.inspect_slides_enabled:
             return _inspect_tool_result(
                 _serialize_inspect_payload(
@@ -6188,11 +6365,15 @@ class Tools:
             )
 
         attached = _find_pptx_attachment(__messages__)
-        if attached and fid != attached:
+        # A real id other than the attachment may be a deck this tool saved
+        # (inspect before edit_presentation); only a failed load is rejected.
+        if attached and fid != attached and not _is_files_api_id(fid):
             return _retry_tool_result(_wrong_reference_id_message(fid, attached))
 
         t_inspect = time.monotonic()
         data, fname, err = await _load_reference_pptx(fid, __request__, __user__)
+        if (err or not data) and attached and fid != attached:
+            return _retry_tool_result(_wrong_reference_id_message(fid, attached))
         if err or not data:
             return _inspect_tool_result(
                 _serialize_inspect_payload(
@@ -6239,6 +6420,8 @@ class Tools:
             payload.get("slide_count"),
             len(payload.get("images") or []),
         )
+        if fid != attached and _GENERATED_DECK_RE.match(fname or ""):
+            return _edit_inspect_tool_result(_compact_inspect_payload(payload))
         return _inspect_tool_result(_compact_inspect_payload(payload))
 
     async def edit_presentation(
@@ -6247,6 +6430,7 @@ class Tools:
         __event_emitter__: Any = None,
         __user__: Optional[dict] = None,
         __messages__: Any = None,
+        __files__: Any = None,
         __metadata__: Any = None,
         __request__: Any = None,
     ) -> str:
@@ -6293,7 +6477,16 @@ class Tools:
         v2 ops: enable_autofit, replace_text_and_fit, split_text, resize_shape,
         set_table_cell, set_font_pt. shrink_font optional mode: fit (default),
         to_min, target (requires target_pt). See doc/neura-presentation-edit-hints.md.
+
+        set_background_image {"slide", "overlay", "crop", "overlay_color"} puts
+        the latest image the user attached in this chat behind one slide (no
+        shape_id; one op per slide). overlay 0..0.95 (default 0.7) is the
+        opacity of a layer in the slide's old background color, so the text
+        stays readable: lower = clearer photo. crop {"top","bottom","left",
+        "right"} cuts 0..0.45 of each edge first (e.g. a caption or logo baked
+        into the image). Repeating the op on a slide replaces its background.
         """
+        __messages__ = _with_owui_files(__messages__, __files__)
         if not self.valves.presentation_edit_enabled:
             return self._edit_error(
                 "Presentation edit is disabled. Admin: set "
@@ -6360,6 +6553,17 @@ class Tools:
             )
         else:
             await self._emit(__event_emitter__, "Applying edits...", done=False)
+
+        if any(op["op"] == "set_background_image" for op in ops):
+            image = _latest_chat_image(__messages__)
+            if not image:
+                return self._edit_error(
+                    "set_background_image uses the latest image the user attached "
+                    "in this chat, and there is none. Ask the user to attach the image."
+                )
+            for op in ops:
+                if op["op"] == "set_background_image":
+                    op["image"] = image
 
         progress_every = int(self.valves.presentation_edit_progress_every or 0)
         total_ops = len(ops)
@@ -6463,6 +6667,7 @@ class Tools:
         __event_emitter__: Any = None,
         __user__: Optional[dict] = None,
         __messages__: Any = None,
+        __files__: Any = None,
         __metadata__: Any = None,
         __request__: Any = None,
     ) -> str:
@@ -6619,6 +6824,7 @@ class Tools:
         Returns a [TOOL_RESULT ...] line with the markdown link to show the user
         so they can download the .pptx.
         """
+        __messages__ = _with_owui_files(__messages__, __files__)
         if not _HAS_PPTX:
             return self._error("python-pptx is not installed in the runtime.")
         # parse + salvage
