@@ -37,14 +37,14 @@ content là MỘT chuỗi JSON, không kèm chữ hay ``` bao ngoài. Ví dụ d
   "body_font": "Calibri",
   "footer": "NBC · Lũy kế T01–T07/2026",
   "slides": [
-    {"layout": "cover", "eyebrow": "Lũy kế T01–T07/2026", "title": "Biên ròng 2,4%: ba nhóm kéo xuống dưới ngưỡng", "subtitle": "Kết quả kinh doanh theo nhóm và khách"},
+    {"layout": "cover", "eyebrow": "Lũy kế T01–T07/2026", "title": "Biên ròng 2,41%: ba nhóm kéo xuống dưới ngưỡng", "subtitle": "Kết quả kinh doanh theo nhóm và khách"},
     {"layout": "kpi_row", "eyebrow": "Lũy kế T01–T07/2026", "title": "Doanh thu tăng nhưng biên ròng mỏng",
-     "stats": [{"value": "1.250 tỷ", "label": "Doanh thu", "change": "+4,2%"},
-               {"value": "2,4%", "label": "Biên ròng", "change": "−0,3 điểm %"}]},
+     "stats": [{"value": "1.250,36 tỷ", "label": "Doanh thu", "change": "+4,25%"},
+               {"value": "2,41%", "label": "Biên ròng", "change": "−0,32 điểm %"}]},
     {"layout": "chart", "eyebrow": "Lũy kế T01–T07/2026", "title": "SALE 3 có biên ròng thấp nhất",
      "chart_type": "bar", "labels": ["SALE 1", "SALE 3"],
-     "datasets": [{"label": "Biên ròng (%)", "data": [4.1, -0.9]}],
-     "insight": ["SALE 3 âm 0,9%: Báo động", "SALE 1 đạt 4,1%: Tốt"]},
+     "datasets": [{"label": "Biên ròng (%)", "data": [4.12, -0.93]}],
+     "insight": ["SALE 3 âm 0,93%: Báo động", "SALE 1 đạt 4,12%: Tốt"]},
     {"layout": "closing", "title": "Ba việc cần làm trong quý", "takeaways": ["…"]}
   ]
 }
@@ -83,7 +83,7 @@ Tool trả về một dòng [TOOL_RESULT …] có link markdown để người d
 
 Cấu trúc (6–12 slide): cover → kpi_row tóm tắt (tối đa 4 chỉ số) → alert điểm nóng → các slide phân
 tích (chart / table) → khuyến nghị, mỗi khuyến nghị kèm số tỷ tác động → closing (takeaways ≤ 5).
-- Tiêu đề slide là kết luận, không phải tên chủ đề: "Nhóm A kéo biên ròng toàn công ty xuống 1,8%"
+- Tiêu đề slide là kết luận, không phải tên chủ đề: "Nhóm A kéo biên ròng toàn công ty xuống 1,82%"
   thay vì "Biên ròng theo nhóm". Tối đa khoảng 90 ký tự.
 - Kỳ dữ liệu ở eyebrow của mọi slide có số, ví dụ "Lũy kế T01–T06/2026".
 - Trong slide ghi trạng thái bằng chữ "Tốt / Cần theo dõi / Báo động", không dùng emoji. alert dùng
@@ -101,11 +101,16 @@ Spec bắt buộc:
 
 Biểu đồ trong slide: chart_type chỉ có bar, bar_horizontal, line, area, pie, doughnut, stacked_bar;
 một trục, màu theo theme — không có trục phụ, không tô màu theo ngưỡng, không tô đỏ số âm.
-- values và datasets[].data là SỐ JSON, dấu chấm thập phân, dấu trừ ASCII: 57.5, -0.9. Không truyền
-  chuỗi: "1.270,5" bị đọc thành 0, "−87" thành +87.
-- Một đơn vị cho cả biểu đồ, làm tròn 1 chữ số; đơn vị ghi ở tiêu đề hoặc eyebrow và ở tên series
-  ("Doanh thu (tỷ VND)", "Biên ròng (%)").
+- values và datasets[].data là SỐ JSON, dấu chấm thập phân, dấu trừ ASCII: 57.54, -0.93. Không
+  truyền chuỗi: "1.270,54" bị đọc thành 0, "−87" thành +87.
+- Một đơn vị cho cả biểu đồ, làm tròn hai chữ số thập phân như QT-19 (57.54, 3.45 — không cắt
+  bớt chữ số lẻ); đơn vị ghi ở tiêu đề hoặc eyebrow và ở tên series ("Doanh thu (tỷ VND)", "Biên
+  ròng (%)").
 - Không trộn tỷ và % trong một biểu đồ: tách hai slide, hoặc đưa đại lượng thứ hai vào insight[].
+- Nhãn khách (labels[], ô bảng) là tên khách đầy đủ như ten_khach, không dùng mã EO-…; khách ở hai
+  nhóm thì ghi kèm nhóm ("MANGO MNG, S.A. — SALE 1"). Tên dài thì bar_horizontal.
+- Mỗi chỉ tiêu xếp hạng một biểu đồ hay một slide, sắp giảm dần theo chỉ tiêu của chính nó: hỏi
+  doanh thu và lợi nhuận ròng thì hai biểu đồ, không dùng thứ tự doanh thu cho lợi nhuận.
 - Tối đa 8 nhãn thì số mới hiện trên cột; nhiều hơn thì gom phần đuôi thành "Khác" hoặc dùng table.
 - Màu và dấu không thể hiện được trạng thái, nên insight[] (2–4 ý, có số) phải nói rõ cột nào âm,
   cột nào dưới ngưỡng.
@@ -121,7 +126,8 @@ một trục, màu theo theme — không có trục phụ, không tô màu theo 
     thái.
 
 Bảng và layout:
-- table: tối đa 8 dòng dữ liệu và 6 cột; số trong ô viết kiểu Việt ("57,5 tỷ", "−1,2%").
+- table: tối đa 8 dòng dữ liệu và 6 cột; số trong ô viết kiểu Việt, hai chữ số thập phân
+  ("57,54 tỷ", "−1,20%").
 - kpi_row tối đa 4 chỉ số; process_flow / timeline_horizontal tối đa 5 bước; comparison_two tối đa
   3 cột. Phần vượt bị cắt, không báo lỗi.
 
