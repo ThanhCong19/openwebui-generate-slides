@@ -2488,11 +2488,31 @@ def _inspect_master_decoration_hint(pack: _TemplatePack) -> list[dict]:
     return out
 
 
-def _inspect_hints(pack: _TemplatePack) -> dict:
+# Slide "chuyển mục" của một template: nằm giữa, 1–2 ô chữ ngắn, không bảng, không ô chữ nào cao
+# quá ngưỡng này (tính theo chiều cao slide) — ô thân bài của slide nội dung thường cao hơn nhiều.
+_SECTION_MAX_TEXT_SHAPES = 2
+_SECTION_MAX_CHARS = 80
+_SECTION_MAX_BOX_HEIGHT = 0.35
+
+
+def _looks_like_section(st: _SlideTemplate, slide_height_in: float) -> bool:
+    texts = [sh for sh in st.shapes if sh.has_text and (sh.text or "").strip()]
+    if not texts or len(texts) > _SECTION_MAX_TEXT_SHAPES:
+        return False
+    if any(sh.kind == "table" or sh.table for sh in st.shapes):
+        return False
+    if sum(len((sh.text or "").strip()) for sh in texts) > _SECTION_MAX_CHARS:
+        return False
+    limit = _SECTION_MAX_BOX_HEIGHT * (slide_height_in or SLIDE_H_IN)
+    return all(sh.bbox.h <= limit for sh in texts)
+
+
+def _likely_roles(pack: _TemplatePack) -> list[dict]:
+    """Vai trò đoán được của từng slide mẫu: bìa (0), nội dung, chuyển mục, kết thúc (cuối)."""
     roles: list[dict] = []
     n = len(pack.slides)
     if n == 0:
-        return {"likely_roles": roles, "uncloneable": []}
+        return roles
     if n == 1:
         roles.append({"index": 0, "role": "content", "confidence": "low"})
     else:
@@ -2510,6 +2530,39 @@ def _inspect_hints(pack: _TemplatePack) -> dict:
                         r["role"] = "cover"
         except Exception:
             pass
+    middle = range(1, n - 1) if n >= 3 else range(0)
+    sections = {
+        i for i in middle if _looks_like_section(pack.slides[i], pack.slide_height_in)
+    }
+    contents = [i for i in middle if i not in sections]
+    if sections and contents:
+        # Slide nội dung = slide giữa đầu tiên không phải chuyển mục; luôn còn ít nhất một.
+        roles = [r for r in roles if r["role"] != "content"]
+        roles.append({"index": contents[0], "role": "content", "confidence": "low"})
+        roles.extend(
+            {"index": i, "role": "section", "confidence": "low"} for i in sorted(sections)
+        )
+        roles.sort(key=lambda r: r["index"])
+    return roles
+
+
+def _role_template_mapping(pack: _TemplatePack) -> dict:
+    """template_mapping suy từ vai trò, cho deck không reuse trên mẫu trình bày chung."""
+    first: dict[str, int] = {}
+    for r in _likely_roles(pack):
+        first.setdefault(r["role"], int(r["index"]))
+    content = first.get("content", 0)
+    mapping = {"content": content, "default": content}
+    for role in ("cover", "section", "closing"):
+        if role in first:
+            mapping[role] = first[role]
+    return mapping
+
+
+def _inspect_hints(pack: _TemplatePack) -> dict:
+    roles = _likely_roles(pack)
+    if not roles:
+        return {"likely_roles": roles, "uncloneable": []}
     role_by_index = {r["index"]: r["role"] for r in roles}
     hints: dict = {
         "likely_roles": roles,
@@ -2587,6 +2640,40 @@ def _serialize_inspect_payload(
         "hints": _inspect_hints(pack),
     }
     return payload
+
+
+# Định dạng kết quả summarize_template; Open WebUI (slides_template/summary.py) đọc trường version.
+SUMMARY_VERSION = 1
+_SUMMARY_HINT_CHARS = 40
+
+
+def summarize_template(data: bytes) -> dict:
+    """Tóm tắt một template .pptx cho QTTM Admin ▸ Cấu hình dự án (khối skill, chú thích xem
+    trước): {version, slide_count, slides: [{index, role, text_ids, table_ids, text_hints}]}.
+
+    Id lấy đúng từ inventory của inspect_slides (_compact_inspect_payload) nên model dùng thẳng
+    trong reuse. index đếm từ 0. Tệp hỏng → ValueError.
+    """
+    pack = _parse_reference_pptx(data)
+    payload = _serialize_inspect_payload(pack, ok=True)
+    compact = _compact_inspect_payload(payload)
+    role_by_index = {r["index"]: r["role"] for r in payload["hints"]["likely_roles"]}
+    slides = []
+    for st in compact["slides"]:
+        texts = st.get("text") or []
+        slides.append(
+            {
+                "index": st["index"],
+                "role": role_by_index.get(st["index"], "content"),
+                "text_ids": [t["id"] for t in texts],
+                "table_ids": [t["id"] for t in st.get("tables") or []],
+                "text_hints": [
+                    " ".join(str(t.get("text") or "").split())[:_SUMMARY_HINT_CHARS]
+                    for t in texts
+                ],
+            }
+        )
+    return {"version": SUMMARY_VERSION, "slide_count": len(pack.slides), "slides": slides}
 
 
 def _retry_tool_result(message: str) -> str:
@@ -2735,6 +2822,56 @@ def _wrong_reference_id_message(sent_id: str, attached: str) -> str:
     )
 
 
+# Tệp trong bảng Files do QTTM Admin ▸ Cấu hình dự án tải lên làm mẫu trình bày chung; chỉ tệp mang
+# marker này mới được đọc bỏ qua kiểm chủ sở hữu (xem _load_reference_pptx).
+_DEFAULT_TEMPLATE_KIND = "slides-template"
+
+
+def _default_template_id(valves) -> str:
+    """Mã mẫu trình bày chung đang có hiệu lực ("" khi chưa đặt hoặc template mode tắt)."""
+    if not getattr(valves, "template_mode_enabled", False):
+        return ""
+    return str(getattr(valves, "default_template_file_id", "") or "").strip()
+
+
+def _default_id_kwargs(default_id: str) -> dict:
+    """Chỉ truyền default_id khi có mẫu chung: bài test upstream thay _load_reference_pptx bằng
+    hàm giả ba tham số."""
+    return {"default_id": default_id} if default_id else {}
+
+
+def _stale_default_message(sent_id: str, default_id: str) -> str:
+    """Không có tệp đính kèm, model gửi một id không đọc được (thường là mẫu mặc định cũ còn
+    trong lịch sử chat): bảo gọi lại với mẫu mặc định hiện tại."""
+    return (
+        f"reference_file_id {sent_id!r} could not be loaded. The organisation default "
+        f'template is now "{default_id}". Do not tell the user the template is missing. '
+        f'Call generate_slides again with reference_file_id="{default_id}" (or omit it), '
+        "using slide indexes and text ids of that template: they are listed in the "
+        'skill block "Mẫu trình bày mặc định", or call inspect_slides without file_id.'
+    )
+
+
+def _default_unreadable_reuse_message(reason: str) -> str:
+    """Mẫu mặc định không đọc được mà spec có reuse: gửi lại không reuse thì ra deck dựng sẵn.
+    Không mở đầu bằng "Error:" và không dùng từ khoá về quyền — middleware của QTTM coi đó là
+    từ chối quyền và dừng vòng gọi tool."""
+    return (
+        f"The organisation default template could not be read ({reason}). "
+        "Call generate_slides again without reuse and without reference_file_id, using "
+        "the built-in layouts (cover, kpi_row, chart, table, closing, ...). The tool "
+        "builds a classic deck and tells the user why."
+    )
+
+
+def _default_unreadable_note(reason: str) -> str:
+    """Ghi chú cho người dùng khi deck rơi về giao diện dựng sẵn."""
+    return (
+        f"Chưa áp được mẫu trình bày chung của tổ chức ({reason}); deck dùng giao diện "
+        "mặc định. Báo quản trị viên kiểm Admin ▸ Cấu hình dự án ▸ Mẫu trình bày."
+    )
+
+
 def _invented_reference_id_message(ref_id: str, messages: Any) -> str:
     """Tell the model to retry generate_slides with the real Files API id."""
     attached = _find_pptx_attachment(messages)
@@ -2817,12 +2954,26 @@ def _file_model_name_and_type(file_obj) -> tuple[str, str]:
     return str(name or "template.pptx"), str(ctype or "")
 
 
+def _is_default_template_file(file_obj) -> bool:
+    data = getattr(file_obj, "data", None)
+    if not isinstance(data, dict) and hasattr(data, "model_dump"):
+        data = data.model_dump()
+    return isinstance(data, dict) and data.get("aibi_kind") == _DEFAULT_TEMPLATE_KIND
+
+
 async def _load_reference_pptx(
     file_id: str,
     request: Any,
     user_dict: Optional[dict],
+    *,
+    default_id: str = "",
 ) -> tuple[Optional[bytes], Optional[str], Optional[str]]:
-    """Download reference .pptx bytes. Returns (data, filename, error_message)."""
+    """Download reference .pptx bytes. Returns (data, filename, error_message).
+
+    `default_id` = mẫu trình bày chung (valve default_template_file_id). Tệp đó thuộc owner giả
+    của QTTM nên mọi người dùng đọc được, nhưng chỉ khi mang marker data.aibi_kind; chỉ
+    generate_slides và inspect_slides truyền tham số này (edit_presentation thì không).
+    """
     fid = (file_id or "").strip()
     if not fid:
         return None, None, "Missing file_id."
@@ -2831,6 +2982,7 @@ async def _load_reference_pptx(
     if not user_id:
         return None, None, "Missing user context for file access."
 
+    is_default = bool(default_id) and fid == default_id.strip()
     if _HAS_OWUI_FILE_DOWNLOAD and _OwuiFiles is not None and _OwuiStorage is not None:
         try:
             file_obj = None
@@ -2842,6 +2994,8 @@ async def _load_reference_pptx(
                 candidate = await _maybe_await(_OwuiFiles.get_file_by_id(fid))
                 owner = getattr(candidate, "user_id", None)
                 if candidate and str(owner) == str(user_id):
+                    file_obj = candidate
+                elif candidate and is_default and _is_default_template_file(candidate):
                     file_obj = candidate
             if file_obj is None:
                 return None, None, "File not found or not accessible."
@@ -2870,6 +3024,10 @@ async def _load_reference_pptx(
         except Exception as exc:
             log.exception("[inspect_slides] in-process file load failed")
             return None, None, f"Could not read template file: {exc}"
+
+    if is_default:
+        # Đường HTTP gọi Files API bằng cookie người dùng: chỉ admin tải được tệp của owner giả.
+        return None, None, "Default template is only readable inside Open WebUI."
 
     if _HAS_HTTPX and request is not None:
         try:
@@ -5986,6 +6144,13 @@ class Tools:
                 "Requires reference_file_id in the generate JSON."
             ),
         )
+        default_template_file_id: str = Field(
+            default="",
+            description=(
+                "Mã Files API của template mặc định. Do QTTM Admin ▸ Cấu hình dự án "
+                "ghi; không sửa tay."
+            ),
+        )
         inspect_slides_enabled: bool = Field(
             default=True,
             description="Allow inspect_slides tool (template inventory JSON).",
@@ -6172,8 +6337,9 @@ class Tools:
         "text_image_right": 1.06, "image_left_text_right": 1.06,
     }
 
-    async def _prefetch_images(self, slides, request, user_dict):
+    async def _prefetch_images(self, slides, request, user_dict, valves=None):
         """Resolve image bytes for image layouts and stash into slide['_img']."""
+        valves = valves or self.valves
         for s in slides:
             layout = _resolve_layout(s)
             if layout not in ("image_full_caption", "image_grid",
@@ -6185,7 +6351,7 @@ class Tools:
                 items = s.get("images") or s.get("items") or s.get("gallery") or []
                 out = []
                 for it in _as_list(items)[:4]:
-                    out.append(await _resolve_one_image(it, self.valves, request,
+                    out.append(await _resolve_one_image(it, valves, request,
                                                         user_dict, ratio))
                 s["_img"] = out
             else:
@@ -6198,7 +6364,7 @@ class Tools:
                                   ("url", "url"), ("base64", "base64")):
                         if s.get(k):
                             spec_item[dk] = s[k]
-                s["_img"] = await _resolve_one_image(spec_item, self.valves, request,
+                s["_img"] = await _resolve_one_image(spec_item, valves, request,
                                                      user_dict, ratio)
 
     # -- rendering pipeline ----------------------------------------------
@@ -6208,11 +6374,13 @@ class Tools:
         *,
         template_pack: Optional[_TemplatePack] = None,
         reference_bytes: Optional[bytes] = None,
+        valves=None,
     ):
+        valves = valves or self.valves
         raw_slides = _first(spec, "slides", "sections", "pages", "deck",
                             "slideshow", "presentation", default=[])
         slides = [s for s in _as_list(raw_slides) if isinstance(s, dict)]
-        footer = (spec.get("footer") or self.valves.footer_label or
+        footer = (spec.get("footer") or valves.footer_label or
                   spec.get("title") or "").strip()
         mapping = spec.get("template_mapping")
         source_prs = None
@@ -6315,8 +6483,11 @@ class Tools:
         IMPORTANT: call view_skill("slides") FIRST — it says when to inspect and
         how to use the ids. Omit `file_id` to read the .pptx attached in this chat.
         """
+        # Chụp valves một lần: instance module dùng chung, mỗi lượt chat Open WebUI gán lại
+        # .valves; lượt đang chạy phải giữ nguyên mẫu mặc định lúc bắt đầu.
+        v = self.valves
         __messages__ = _with_owui_files(__messages__, __files__)
-        if not self.valves.inspect_slides_enabled:
+        if not v.inspect_slides_enabled:
             return _inspect_tool_result(
                 _serialize_inspect_payload(
                     None,
@@ -6333,7 +6504,10 @@ class Tools:
                 )
             )
 
-        fid = (file_id or "").strip() or _find_pptx_attachment(__messages__)
+        attached = _find_pptx_attachment(__messages__)
+        default_id = _default_template_id(v)
+        # Không file_id, không đính kèm → mẫu trình bày chung của tổ chức (nếu có).
+        fid = (file_id or "").strip() or attached or default_id
         if not fid:
             return _inspect_tool_result(
                 _serialize_inspect_payload(
@@ -6343,16 +6517,19 @@ class Tools:
                 )
             )
 
-        attached = _find_pptx_attachment(__messages__)
         # A real id other than the attachment may be a deck this tool saved
         # (inspect before edit_presentation); only a failed load is rejected.
         if attached and fid != attached and not _is_files_api_id(fid):
             return _retry_tool_result(_wrong_reference_id_message(fid, attached))
 
         t_inspect = time.monotonic()
-        data, fname, err = await _load_reference_pptx(fid, __request__, __user__)
+        data, fname, err = await _load_reference_pptx(
+            fid, __request__, __user__, **_default_id_kwargs(default_id)
+        )
         if (err or not data) and attached and fid != attached:
             return _retry_tool_result(_wrong_reference_id_message(fid, attached))
+        if (err or not data) and not attached and default_id and fid != default_id:
+            return _retry_tool_result(_stale_default_message(fid, default_id))
         if err or not data:
             return _inspect_tool_result(
                 _serialize_inspect_payload(
@@ -6377,7 +6554,9 @@ class Tools:
             )
 
         images_json: list[dict] = []
-        if self.valves.inspect_extract_images:
+        # Mẫu chung: không trích ảnh, nếu không mỗi lần inspect lại chép ảnh của mẫu vào tệp
+        # của người dùng.
+        if v.inspect_extract_images and fid != default_id:
             images_json = await self._build_inspect_images(
                 data, pack, __request__, __user__
             )
@@ -6420,8 +6599,9 @@ class Tools:
         when to edit instead of regenerating. `content` is a single JSON string:
         {"presentation_file_id", "title", "operations": [...]}.
         """
+        v = self.valves
         __messages__ = _with_owui_files(__messages__, __files__)
-        if not self.valves.presentation_edit_enabled:
+        if not v.presentation_edit_enabled:
             return self._edit_error(
                 "Presentation edit is disabled. Admin: set "
                 "presentation_edit_enabled=true."
@@ -6435,7 +6615,7 @@ class Tools:
         ops_failed = 0
 
         try:
-            spec = _parse_edit_spec(content, self.valves)
+            spec = _parse_edit_spec(content, v)
         except ValueError as exc:
             msg = str(exc)
             if "presentation_file_id" in msg or "Files API" in msg:
@@ -6445,10 +6625,13 @@ class Tools:
         fid = spec["presentation_file_id"]
         ops = spec["operations"]
 
-        if _presentation_id_is_template_attachment(fid, __messages__):
+        default_id = str(v.default_template_file_id or "").strip()
+        if _presentation_id_is_template_attachment(fid, __messages__) or (
+            default_id and fid == default_id
+        ):
             return _retry_tool_result(
-                "presentation_file_id is the attached template file, not the "
-                "generated deck. Use the file_id from the last generate_slides or "
+                "presentation_file_id is a template file (the attached template or "
+                "the organisation default template), not the generated deck. Use the file_id from the last generate_slides or "
                 "edit_presentation output. Never use reference_file_id or the "
                 "template inspect id for edit."
             )
@@ -6499,11 +6682,11 @@ class Tools:
                 if op["op"] == "set_background_image":
                     op["image"] = image
 
-        progress_every = int(self.valves.presentation_edit_progress_every or 0)
+        progress_every = int(v.presentation_edit_progress_every or 0)
         total_ops = len(ops)
         try:
             for i, op in enumerate(ops):
-                if _apply_edit_op(prs, op, self.valves, i):
+                if _apply_edit_op(prs, op, v, i):
                     ops_mutated += 1
                 ops_applied += 1
                 if progress_every > 0 and (
@@ -6530,7 +6713,7 @@ class Tools:
             return self._edit_error(str(exc))
 
         if (
-            self.valves.presentation_edit_warn_noop
+            v.presentation_edit_warn_noop
             and ops_applied > 0
             and ops_mutated == 0
         ):
@@ -6612,6 +6795,8 @@ class Tools:
         layouts, the template (reuse) workflow and the deck rules. Never call
         this tool without reading it. `content` is a single JSON string.
         """
+        # Chụp valves một lần (xem inspect_slides).
+        v = self.valves
         __messages__ = _with_owui_files(__messages__, __files__)
         if not _HAS_PPTX:
             return self._error("python-pptx is not installed in the runtime.")
@@ -6631,8 +6816,8 @@ class Tools:
                 return self._error(f"Invalid JSON: {exc}")
         if not isinstance(spec, dict):
             return self._error("The `content` parameter must be a JSON object.")
-        if spec.get("theme") in (None, "") and self.valves.default_theme:
-            spec["theme"] = self.valves.default_theme
+        if spec.get("theme") in (None, "") and v.default_theme:
+            spec["theme"] = v.default_theme
 
         _pre_slides = [
             s
@@ -6645,19 +6830,25 @@ class Tools:
         ref_id = (spec.get("reference_file_id") or "").strip()
         attached = (
             _find_pptx_attachment(__messages__)
-            if self.valves.template_mode_enabled
+            if v.template_mode_enabled
             else None
         )
         if attached and ref_id != attached:
             # A missing id, a bare number, or a UUID that is not the attachment
             # must not fall through to a classic deck. The model retries.
             return _retry_tool_result(_wrong_reference_id_message(ref_id, attached))
+        # Thứ tự: tệp đính kèm > mẫu trình bày chung (valve) > giao diện dựng sẵn. Thay id
+        # trước khi kiểm "reuse thiếu reference_file_id".
+        default_id = "" if attached else _default_template_id(v)
+        if default_id and not ref_id:
+            ref_id = default_id
+            spec["reference_file_id"] = ref_id
         if _has_reuse and not ref_id:
             return self._error(
                 "slides[].reuse requires reference_file_id (same Files API id as "
                 "inspect_slides on the template .pptx)."
             )
-        if _has_reuse and not self.valves.template_mode_enabled:
+        if _has_reuse and not v.template_mode_enabled:
             return self._error(
                 "slides[].reuse requires admin valve template_mode_enabled=true."
             )
@@ -6666,7 +6857,7 @@ class Tools:
         template_pack = None
         reference_bytes = None
         if ref_id:
-            if not self.valves.template_mode_enabled:
+            if not v.template_mode_enabled:
                 log.warning(
                     "[generate_slides] reference_file_id=%s ignored: "
                     "template_mode_enabled is false",
@@ -6681,9 +6872,34 @@ class Tools:
                     __event_emitter__, "Loading template...", done=False
                 )
                 reference_bytes, _ref_fname, ref_err = await _load_reference_pptx(
-                    ref_id, __request__, __user__
+                    ref_id, __request__, __user__, **_default_id_kwargs(default_id)
                 )
-                if ref_err:
+                using_default = bool(default_id) and ref_id == default_id
+                if ref_err and default_id and not using_default:
+                    return _retry_tool_result(_stale_default_message(ref_id, default_id))
+                if not ref_err and using_default:
+                    try:
+                        template_pack = _parse_reference_pptx(reference_bytes)
+                    except Exception as exc:
+                        log.exception("[generate_slides] default template parse failed")
+                        ref_err = f"invalid .pptx: {exc}"
+                if ref_err and using_default:
+                    log.warning(
+                        "[generate_slides] default template %s unreadable: %s",
+                        ref_id,
+                        ref_err,
+                    )
+                    if _has_reuse:
+                        return _retry_tool_result(
+                            _default_unreadable_reuse_message(ref_err)
+                        )
+                    # Không reuse: vẫn ra deck, giao diện dựng sẵn, kèm ghi chú.
+                    spec.pop("reference_file_id", None)
+                    spec.pop("template_mapping", None)
+                    reference_bytes = None
+                    template_pack = None
+                    template_extra = _default_unreadable_note(ref_err)
+                elif ref_err:
                     return _retry_tool_result(
                         f"Could not load reference_file_id {ref_id!r}: {ref_err}. "
                         "Do not generate a classic deck and do not invent another "
@@ -6691,21 +6907,31 @@ class Tools:
                         "from the successful inspect_slides result, copied exactly, "
                         "and per-slide reuse."
                     )
-                await self._emit(
-                    __event_emitter__, "Applying template...", done=False
-                )
-                try:
-                    template_pack = _parse_reference_pptx(reference_bytes)
-                except Exception as exc:
-                    log.exception("[generate_slides] reference parse failed")
-                    return self._error(f"Invalid template .pptx: {exc}")
-                if self.valves.template_strict_mode:
-                    try:
-                        _validate_template_strict(
-                            template_pack, spec.get("template_mapping")
-                        )
-                    except ValueError as exc:
-                        return self._error(str(exc))
+                if reference_bytes is not None:
+                    await self._emit(
+                        __event_emitter__, "Applying template...", done=False
+                    )
+                    if template_pack is None:
+                        try:
+                            template_pack = _parse_reference_pptx(reference_bytes)
+                        except Exception as exc:
+                            log.exception("[generate_slides] reference parse failed")
+                            return self._error(f"Invalid template .pptx: {exc}")
+                    if (
+                        using_default
+                        and not _has_reuse
+                        and not isinstance(spec.get("template_mapping"), dict)
+                    ):
+                        # Không có mapping thì _pick_template_slide trả slide 0 cho mọi
+                        # layout: mọi slide nằm trên nền bìa. Suy mapping theo vai trò.
+                        spec["template_mapping"] = _role_template_mapping(template_pack)
+                    if v.template_strict_mode:
+                        try:
+                            _validate_template_strict(
+                                template_pack, spec.get("template_mapping")
+                            )
+                        except ValueError as exc:
+                            return self._error(str(exc))
 
         await self._emit(__event_emitter__, "Generating presentation...", done=False)
         try:
@@ -6714,15 +6940,16 @@ class Tools:
             if any(_resolve_layout(s) in ("image_full_caption", "image_grid",
                    "text_image_right", "image_left_text_right") for s in _pf):
                 await self._emit(__event_emitter__, "Fetching images...", done=False)
-                await self._prefetch_images(_pf, __request__, __user__)
+                await self._prefetch_images(_pf, __request__, __user__, valves=v)
             if template_pack is not None:
                 data, n = self._build(
                     spec,
                     template_pack=template_pack,
                     reference_bytes=reference_bytes,
+                    valves=v,
                 )
             else:
-                data, n = self._build(spec)
+                data, n = self._build(spec, valves=v)
         except ValueError as exc:
             return self._error(str(exc))
         except Exception as exc:

@@ -8,7 +8,8 @@ description: Dựng và sửa bản trình bày PowerPoint (.pptx) bằng genera
 Ba hàm:
 - generate_slides dựng bản trình bày .pptx native (biểu đồ Office, bảng, icon) từ một spec JSON và
   trả về link tải.
-- inspect_slides đọc cấu trúc một tệp .pptx (file mẫu người dùng đính kèm, hoặc deck đã tạo).
+- inspect_slides đọc cấu trúc một tệp .pptx (file mẫu người dùng đính kèm, mẫu trình bày chung
+  của tổ chức, hoặc deck đã tạo).
 - edit_presentation sửa một deck đã tạo mà không dựng lại.
 
 Mọi quy tắc dữ liệu của system prompt vẫn áp dụng cho từng con số trên slide: <real_data>,
@@ -131,16 +132,24 @@ Bảng và layout:
 - kpi_row tối đa 4 chỉ số; process_flow / timeline_horizontal tối đa 5 bước; comparison_two tối đa
   3 cột. Phần vượt bị cắt, không báo lỗi.
 
-## Dùng file mẫu (.pptx người dùng đính kèm)
+## Dùng file mẫu (tệp đính kèm hoặc mẫu trình bày chung)
 
-Khi người dùng đính kèm tệp .pptx và muốn làm theo nó ("dùng file này làm mẫu", "giữ giao diện file
-đính kèm", "làm theo template này"):
-- Gọi inspect_slides MỘT lần, để trống file_id — tool tự lấy tệp đang đính kèm. Kết quả là JSON nội
-  bộ: không dán cho người dùng, không gọi lại với id khác. Người dùng chỉ hỏi cấu trúc tệp thì tóm
-  tắt kết quả, không gọi generate_slides.
+Chọn giao diện cho mỗi deck theo thứ tự:
+1. Có tệp .pptx đính kèm trong cuộc trò chuyện và người dùng muốn làm theo nó ("dùng file này làm
+   mẫu", "giữ giao diện file đính kèm") → theo tệp đó.
+2. Không có tệp đính kèm, và cuối mục này có "Mẫu trình bày mặc định của tổ chức" (quản trị viên đặt)
+   → mọi deck dựng theo mẫu đó, kể cả khi người dùng không nhắc tới mẫu. Không hỏi lại người dùng.
+3. Không có cả hai → giao diện dựng sẵn (Spec ở trên).
+
+Dựng deck theo mẫu (tệp đính kèm hay mẫu chung đều vậy):
+- Cần id ô chữ thì gọi inspect_slides MỘT lần, để trống file_id — tool tự lấy tệp đang đính kèm,
+  không có thì lấy mẫu chung. Kết quả là JSON nội bộ: không dán cho người dùng, không gọi lại với id
+  khác. Người dùng chỉ hỏi cấu trúc tệp thì tóm tắt kết quả, không gọi generate_slides. Mẫu chung đã
+  liệt kê slide và id ở mục cuối thì dùng luôn, không cần inspect.
 - Truy vấn số liệu như mọi deck, rồi gọi generate_slides một lần với "reference_file_id" là file_id
-  của inspect, chép đúng từng ký tự. Đó là UUID (8-4-4-4-12 ký tự hex): không bịa, không thay bằng
-  tên tệp hay số slide.
+  của inspect (hoặc reference_file_id của mẫu chung), chép đúng từng ký tự. Đó là UUID (8-4-4-4-12
+  ký tự hex): không bịa, không thay bằng tên tệp hay số slide. Với mẫu chung có thể bỏ trống
+  reference_file_id, tool tự điền.
 - Mỗi slide đầu ra dùng lại một slide mẫu:
   {"reuse": {"slide": <index của slide mẫu>, "text": {"<id>": "chữ mới"}}}
   · index lấy từ slides[].index của inspect (đếm từ 0); id lấy từ slides[].text.
@@ -152,13 +161,19 @@ Khi người dùng đính kèm tệp .pptx và muốn làm theo nó ("dùng file
 - Slide có reuse lấy màu, font, nền của mẫu, nên không áp theme / font / footer của Spec bắt buộc.
   Tiêu đề là kết luận, kỳ dữ liệu ghi vào một ô chữ phù hợp, số liệu theo mọi quy tắc ở trên.
 - Mẫu không có slide hợp với biểu đồ thì dùng slide chart như thường (không reuse): tool vẽ nó trên
-  nền của mẫu.
+  nền của mẫu. Deck không có reuse nào trên mẫu chung: tool tự đặt từng layout lên slide mẫu cùng
+  vai trò (bìa, nội dung, chuyển mục, kết thúc).
 - Tool trả lời id sai hoặc "not the attached template": gọi lại generate_slides với đúng file_id của
   inspect. Không chuyển sang deck thường, không báo người dùng là thiếu mẫu.
+- Tool báo reference_file_id không đọc được và nêu mã mẫu chung hiện tại (mẫu đã được quản trị viên
+  đổi): gọi lại với mã đó và id ô chữ của mẫu đó.
+- Tool báo mẫu chung không đọc được: làm đúng lời tool (gửi lại không reuse, không
+  reference_file_id). Deck ra giao diện dựng sẵn kèm một ghi chú — chuyển ghi chú đó cho người dùng.
 - Dùng file mẫu cần quản trị viên bật valve template_mode_enabled; tắt thì tool bỏ qua
   reference_file_id và ra deck thường — nói rõ điều đó với người dùng.
-- Còn tệp mẫu đính kèm trong cuộc trò chuyện thì mọi deck mới đều theo mẫu đó; người dùng muốn deck
-  không theo mẫu thì đề nghị mở cuộc trò chuyện mới.
+- Còn tệp mẫu đính kèm trong cuộc trò chuyện thì mọi deck mới đều theo tệp đó; người dùng muốn quay
+  về mẫu chung của tổ chức (hoặc giao diện dựng sẵn khi chưa có mẫu chung) thì đề nghị mở cuộc trò
+  chuyện mới. Có mẫu chung mà người dùng muốn giao diện khác thì đề nghị đính kèm tệp .pptx làm mẫu.
 
 ## Sửa deck đã tạo (deck thường hay deck theo mẫu)
 
